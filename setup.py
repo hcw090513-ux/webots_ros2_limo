@@ -49,6 +49,7 @@ setup(
     extras_require={'test': ['pytest']},
     entry_points={
         'console_scripts': [
+            'auto_explorer = webots_ros2_limo.auto_explorer:main',
         ],
     },
 )
