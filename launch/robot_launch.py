@@ -231,10 +231,4 @@ def generate_launch_description():
             description='Use the Webots /clock as ROS 2 time'
         ),
         OpaqueFunction(function=launch_setup),
-
-        auto_explorer_node = Node(
-            package='webots_ros2_limo',
-            executable='auto_explorer',
-            output='screen',
-        )
     ])
