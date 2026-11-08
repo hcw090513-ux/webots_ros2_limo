@@ -7,6 +7,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import OccupancyGrid, Odometry
 from geometry_msgs.msg import Twist
+from visualization_msgs.msg import Marker, MarkerArray
 
 class SmoothCoverageExplorer(Node):
     def __init__(self):
@@ -18,12 +19,14 @@ class SmoothCoverageExplorer(Node):
         self.map_sub = self.create_subscription(OccupancyGrid, '/map', self.map_cb, 10)
         self.odom_sub = self.create_subscription(Odometry, '/odom', self.odom_cb, 10)
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        
+        # RViz2 가시화를 위한 MarkerArray 퍼블리셔 추가
+        self.marker_pub = self.create_publisher(MarkerArray, '/coverage_markers', 10)
 
         self.robot_x = 0.0
         self.robot_y = 0.0
         self.robot_yaw = 0.0
         
-        # 3단계 상태 관리 ('EXPLORE_FRONTIER' -> 'PATROL_UNCOVERED')
         self.mode = 'EXPLORE_FRONTIER'
         self.patrol_cycle = 1
         self.sensor_radius = 1.5  # 가스 센서 감지 반경 (1.5m)
@@ -31,12 +34,9 @@ class SmoothCoverageExplorer(Node):
         self.target_point = None
         self.target_lock_time = 0.0
         self.blacklist = []
-        self.visited_breadcrumbs = []  # 가스 센서 커버리지 확인용 방문 궤적
+        self.visited_breadcrumbs = []
         
-        # 부드러운 조향을 위한 이전 각속도 기억 변수 (Smoothing Filter)
         self.prev_angular_z = 0.0
-        
-        # 끼임 감지 및 탈출 변수
         self.last_check_x = 0.0
         self.last_check_y = 0.0
         self.stuck_counter = 0
@@ -44,7 +44,70 @@ class SmoothCoverageExplorer(Node):
         self.turn_steps = 0
         self.turn_dir = 1.0
         
-        self.get_logger().info('[방식 A 고도화] 부드러운 프론티어 탐색 및 사각지대 순찰 노드를 시작합니다!')
+        # 0.5초마다 RViz 마커 업데이트
+        self.marker_timer = self.create_timer(0.5, self.publish_markers)
+        
+        self.get_logger().info('[가시화 포함] 프론티어 탐색 및 사각지대 순찰 노드를 시작합니다!')
+
+    def publish_markers(self):
+        marker_array = MarkerArray()
+        now = self.get_clock().now().to_msg()
+
+        # 1. 지나온 궤적(가스 센서 감지 반경)을 초록색 반투명 원판으로 표시
+        for i, (vx, vy) in enumerate(self.visited_breadcrumbs):
+            m = Marker()
+            m.header.frame_id = 'map'
+            m.header.stamp = now
+            m.ns = 'sensor_coverage'
+            m.id = i
+            m.type = Marker.CYLINDER
+            m.action = Marker.ADD
+            m.pose.position.x = float(vx)
+            m.pose.position.y = float(vy)
+            m.pose.position.z = 0.01
+            m.pose.orientation.w = 1.0
+            # 지름 = 센서 반경(1.5m) * 2 = 3.0m
+            m.scale.x = self.sensor_radius * 2.0
+            m.scale.y = self.sensor_radius * 2.0
+            m.scale.z = 0.02
+            m.color.r = 0.1
+            m.color.g = 0.9
+            m.color.b = 0.3
+            m.color.a = 0.18  # 겹쳐도 지도가 잘 보이도록 반투명 설정
+            marker_array.markers.append(m)
+
+        # 2. 현재 향하고 있는 목표 지점을 노란색 구(Sphere)로 표시
+        if self.target_point is not None:
+            tm = Marker()
+            tm.header.frame_id = 'map'
+            tm.header.stamp = now
+            tm.ns = 'current_target'
+            tm.id = 9999
+            tm.type = Marker.SPHERE
+            tm.action = Marker.ADD
+            tm.pose.position.x = float(self.target_point[0])
+            tm.pose.position.y = float(self.target_point[1])
+            tm.pose.position.z = 0.15
+            tm.pose.orientation.w = 1.0
+            tm.scale.x = 0.35
+            tm.scale.y = 0.35
+            tm.scale.z = 0.35
+            tm.color.r = 1.0
+            tm.color.g = 0.85
+            tm.color.b = 0.0
+            tm.color.a = 0.9
+            marker_array.markers.append(tm)
+
+        self.marker_pub.publish(marker_array)
+
+    def clear_all_markers(self):
+        # 순찰 회차 리셋 시 RViz 화면의 기존 마커 전체 삭제
+        marker_array = MarkerArray()
+        m = Marker()
+        m.header.frame_id = 'map'
+        m.action = Marker.DELETEALL
+        marker_array.markers.append(m)
+        self.marker_pub.publish(marker_array)
 
     def odom_cb(self, msg):
         self.robot_x = msg.pose.pose.position.x
@@ -54,7 +117,6 @@ class SmoothCoverageExplorer(Node):
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self.robot_yaw = math.atan2(siny_cosp, cosy_cosp)
 
-        # 로봇이 이동한 궤적을 0.5m 간격으로 촘촘히 기록
         if not self.visited_breadcrumbs or math.hypot(
             self.robot_x - self.visited_breadcrumbs[-1][0],
             self.robot_y - self.visited_breadcrumbs[-1][1]
@@ -76,7 +138,6 @@ class SmoothCoverageExplorer(Node):
     def map_cb(self, msg):
         now = time.time()
 
-        # 1. 현재 목표점이 있다면 도착 여부 및 타임아웃(7초) 확인
         if self.target_point is not None:
             dist_to_target = math.hypot(
                 self.target_point[0] - self.robot_x,
@@ -100,7 +161,6 @@ class SmoothCoverageExplorer(Node):
         unknown_mask = (grid == -1)
         obstacle_mask = (grid > 50)
 
-        # 벽에서 6칸(30cm) 이내 픽셀은 안전을 위해 제외
         obs_near = obstacle_mask.copy()
         for _ in range(6):
             obs_near |= (
@@ -109,7 +169,6 @@ class SmoothCoverageExplorer(Node):
             )
         safe_free_mask = free_mask & (~obs_near)
 
-        # 2. [Phase 1] 프론티어(미지의 경계선) 검출
         up = np.roll(unknown_mask, -1, axis=0)
         down = np.roll(unknown_mask, 1, axis=0)
         left = np.roll(unknown_mask, -1, axis=1)
@@ -121,7 +180,6 @@ class SmoothCoverageExplorer(Node):
         best_target = None
         best_score = -999.0
 
-        # 한 부위만 맴도는 현상을 막기 위해 너무 가까운 점(<1.2m)은 배제하고 정면 방향 우대
         if len(fx) > 12:
             self.mode = 'EXPLORE_FRONTIER'
             wx = ox + (fx + 0.5) * res
@@ -134,20 +192,17 @@ class SmoothCoverageExplorer(Node):
                     continue
                 angle_to_p = math.atan2(wy[i] - self.robot_y, wx[i] - self.robot_x)
                 angle_diff = abs(math.atan2(math.sin(angle_to_p - self.robot_yaw), math.cos(angle_to_p - self.robot_yaw)))
-                
-                # 적당한 거리(2.0~3.5m)에 있으면서 로봇 정면 방향인 곳을 최우선 선택 (맴돌기 방지)
                 score = -abs(d - 2.5) - (1.5 * angle_diff)
                 if score > best_score:
                     best_score = score
                     best_target = (wx[i], wy[i])
 
-        # 3. [Phase 2] 프론티어가 없다면 -> 가스 센서 미탐지 사각지대 탐색
         if best_target is None:
             if self.mode == 'EXPLORE_FRONTIER':
                 self.mode = 'PATROL_UNCOVERED'
                 self.blacklist.clear()
                 self.get_logger().info(
-                    f'[Phase 2 전환] 1차 맵핑 완료! 미방문 사각지대({self.patrol_cycle}회차) 탐색을 시작합니다.'
+                    f'[Phase 2 전환] 1차 맵핑 완료! 초록색 마커가 닿지 않은 사각지대({self.patrol_cycle}회차)를 탐색합니다.'
                 )
 
             sy, sx = np.where(safe_free_mask)
@@ -169,14 +224,14 @@ class SmoothCoverageExplorer(Node):
                     best_score = score
                     best_target = (px, py)
 
-            # 4. [Phase 3] 전 구역 탐색 완료 시 -> 방문 기록 리셋 후 정기 순찰 무한 반복!
             if best_target is None:
                 self.patrol_cycle += 1
+                self.clear_all_markers()
                 self.visited_breadcrumbs.clear()
                 self.visited_breadcrumbs.append((self.robot_x, self.robot_y))
                 self.blacklist.clear()
                 self.get_logger().info(
-                    f'[전 구역 이상 없음] 방문 기록을 리셋하고 {self.patrol_cycle}회차 정기 순찰을 시작합니다!'
+                    f'[전 구역 스캔 완료] 마커를 초기화하고 {self.patrol_cycle}회차 정기 순찰을 시작합니다!'
                 )
                 return
 
@@ -208,7 +263,6 @@ class SmoothCoverageExplorer(Node):
 
         twist = Twist()
 
-        # [탈출 1단계] 직선 후진
         if self.backup_steps > 0:
             self.backup_steps -= 1
             twist.linear.x = -0.24
@@ -218,7 +272,6 @@ class SmoothCoverageExplorer(Node):
             self.cmd_pub.publish(twist)
             return
 
-        # [탈출 2단계] 부드러운 제자리 회전
         if self.turn_steps > 0:
             self.turn_steps -= 1
             twist.linear.x = 0.0
@@ -227,7 +280,6 @@ class SmoothCoverageExplorer(Node):
             self.cmd_pub.publish(twist)
             return
 
-        # [끼임 감지] 1.5초 동안 5cm 미만 이동 시 즉시 목표 포기 후 탈출
         self.stuck_counter += 1
         if self.stuck_counter >= 15:
             moved_dist = math.hypot(self.robot_x - self.last_check_x, self.robot_y - self.last_check_y)
@@ -250,7 +302,6 @@ class SmoothCoverageExplorer(Node):
             self.turn_steps = 10
             return
 
-        # 주행 및 조향 계산
         if front_dist < 0.75:
             twist.linear.x = 0.08
             raw_angular = 0.85 if left_dist >= right_dist else -0.85
@@ -264,13 +315,11 @@ class SmoothCoverageExplorer(Node):
             else:
                 raw_angular = 0.65 * open_space_angle
 
-            # 벽면 반발력 (벽에서 일정 거리 유지)
             if right_dist < 0.55:
                 raw_angular += 0.55 * (0.55 - right_dist)
             if left_dist < 0.55:
                 raw_angular -= 0.55 * (0.55 - left_dist)
 
-        # 핵심: 조향각 스무딩 필터 적용 (좌우 흔들림 제거 및 매끄러운 곡선 주행)
         smoothed_angular = (0.55 * self.prev_angular_z) + (0.45 * raw_angular)
         twist.angular.z = max(-0.75, min(0.75, smoothed_angular))
         self.prev_angular_z = twist.angular.z
